@@ -18,3 +18,7 @@ Serial Commands:
 Calibration Overview
 When calibration is run:
 The stepper performs a full (or partial) revolution in increments, at each step, it reads all four LDRs and records the total brightness. The brightest position is saved as the new "home zero" position, and the stepper returns there and zeroes the position counter.
+
+Required Libraries:
+  -AccelStepper
+  -Built in Servo Library
