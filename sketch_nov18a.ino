@@ -1,11 +1,17 @@
-// Solar tracker with AccelStepper + Servo, calibration, parking, serial debug,
-// plus azimuth bounds to avoid wire wrapping/unplugging.
+// Solar tracker with AccelStepper + Servo, calibration, parking, serial debug.
+// This version uses a SOFTWARE HOMING sequence (moving to the mechanical stop)
+// to define absolute azimuth bounds and prevent wire wrapping.
 //
 // - Azimuth: 28BYJ-48 via ULN2003 driven with AccelStepper (HALF4WIRE)
 // - Elevation: hobby servo
-// LDRs on A0..A3 as TL, TR, BL, BR.
-// ULN2003 IN1..IN4 on pins STEPPER_PIN[0..3].
-// Servo signal on SERVO_PIN.
+// - LDRs on A0..A3 as TL, TR, BL, BR.
+// - ULN2003 IN1..IN4 on pins STEPPER_PIN[0..3].
+//
+// !!! WARNING !!!
+// This method relies on forcing the motor to stall against its mechanical stop.
+// This is generally safe for small, low-power motors like the 28BYJ-48,
+// but should be done at reduced speed and acceleration to minimize strain.
+// !!! WARNING !!!
 
 #include <AccelStepper.h>
 #include <Servo.h>
@@ -25,11 +31,11 @@ const int SERVO_PIN = 6;
 const int STEPPER_PIN[4] = {8, 9, 10, 11};
 
 // --- AccelStepper (HALF4WIRE used for stepper motor half-step) ---
-// Note: accStepper constructor order (pin1, pin3, pin2, pin4) can differ by wiring.
-// We're using the 4-pin HALF4WIRE constructor with array order as given.
+// PIN ORDER REVERSED HERE: {3], [2], [1], [0] instead of {0], [1], [2], [3]
+// This reverses the motor direction to fix the orientation issue.
 AccelStepper azStepper(AccelStepper::HALF4WIRE,
-                       STEPPER_PIN[0], STEPPER_PIN[1],
-                       STEPPER_PIN[2], STEPPER_PIN[3]);
+                       STEPPER_PIN[3], STEPPER_PIN[2],
+                       STEPPER_PIN[1], STEPPER_PIN[0]);
 
 // --- Settings (tweakable) ---
 const int NUM_AVG = 10;            // moving average window for LDRs
@@ -49,38 +55,42 @@ const int SERVO_CENTER = 90;        // center angle at startup
 const int SERVO_STEP_PER_DIFF = 80; // larger => smaller servo movement per ADC unit
 
 // AccelStepper motion tuning
-const float STEPPER_MAX_SPEED = 3000.0;   // [steps per second] -- raised to make it faster
-const float STEPPER_ACCEL = 1000.0;        // [steps per second squared] -- faster accel
+const float STEPPER_MAX_SPEED = 3000.0;   // [steps per second]
+const float STEPPER_ACCEL = 1000.0;        // [steps per second squared]
+const float STEPPER_HOME_SPEED = 800.0;   // Slower speed for finding mechanical stop
 
 const long STEPS_PER_REV = 2048L; // assumed steps per rotation (28BYJ-48)
 
-// --- Azimuth limiting (prevents cable wrap)
-// Enable limits and set min/max absolute stepper positions (in stepper steps).
-// Choose values appropriate to physical limits. Limits are applied relative to stored zero.
+// --- Azimuth limiting (prevents cable wrap and wire jumble area) ---
+// AZ_MIN_POS is 0, set by the 'h' (Homing) command hitting the mechanical stop.
 const bool AZ_LIMITS_ENABLED = true;
-// Example: allow roughly +/- one full rev (tweak to your needs)
-const long AZ_MIN_POS = -1000;   // minimum allowed RELATIVE position (steps) from zero
-const long AZ_MAX_POS =  1000;   // maximum allowed RELATIVE position (steps) from zero
+const long AZ_MIN_POS = 0;     
+// AZ_MAX_POS defines the maximum safe position, beyond which the tracker
+// enters the cable jumble zone or risks twisting wires.
+// It is adjusted via the 'B' command (Set Boundary).
+long AZ_MAX_POS = 2048;  // Default: slightly less than 2 full revs (2 * 2048 = 4096)
 
 // --- Calibration settings ---
-const bool AUTO_CALIBRATE_ON_BOOT = false; // set true if want auto-calibration on boot
-const int CAL_SCAN_STEP = 16;  // coarse step increment during scan (half-steps). larger -> faster scan, less resolution
+const bool AUTO_CALIBRATE_ON_BOOT = false; // set true to home and scan on boot
+const int CAL_SCAN_STEP = 16;  // coarse step increment during scan
 const int CAL_SCAN_DELAY_MS = 5; // delay between step moves during scan
+const long HOME_BIND_DISTANCE = STEPS_PER_REV * 3; // Steps to ensure motor hits stop
 
 // --- Parking / night detection ---
 const int PARK_SERVO_ANGLE = SERVO_MIN;    // servo angle when parked
-const long PARK_AZ_REL_POS = 0;            // parking azimuth relative to calibrated home
-const int PARK_LIGHT_THRESHOLD = 150;      // if total light (sum of 4 sensors) below this => consider dark
-const unsigned long PARK_LIGHT_TIME_MS = 30UL * 1000UL; // time below threshold to trigger park (30s default)
+const long PARK_AZ_REL_POS = 0;            // parking azimuth relative to *calibrated sun*
+const int PARK_LIGHT_THRESHOLD = 150;      // if total light below this => consider dark
+const unsigned long PARK_LIGHT_TIME_MS = 30UL * 1000UL; // 30s
 
 // --- Debug / serial ---
 bool SERIAL_DEBUG = true;
 unsigned long lastDebugMillis = 0;
-const unsigned long DEBUG_INTERVAL_MS = 300; // print debug every 300 ms
+const unsigned long DEBUG_INTERVAL_MS = 300;
 
 // --- EEPROM addresses ---
-const int EEPROM_AZ_ZERO_ADDR = 0;   // 4 bytes (long)
-const int EEPROM_SERVO_ADDR   = 8;   // 2 bytes (int) at offset
+const int EEPROM_SOLAR_HOME_ADDR = 0;   // 4 bytes (long)
+const int EEPROM_SERVO_ADDR      = 8;   // 2 bytes (int) at offset
+const int EEPROM_AZ_MAX_ADDR     = 12;  // 4 bytes (long) for max limit
 
 // --- Globals ---
 Servo tiltServo;
@@ -90,40 +100,42 @@ int currentServo = SERVO_CENTER;
 
 bool isParked = false;
 unsigned long lightBelowSince = 0;
-bool calibrated = false;
+bool calibrated = false; // Tracks if we have run a light-scan
 
-// Persisted zero: this stores the stepper position (absolute reading) that represents "home/zero".
-// Limits are applied around this value (i.e. allowed absolute positions = azimuthZero + AZ_MIN_POS .. azimuthZero + AZ_MAX_POS)
-long azimuthZero = 0;
+// This stores the STEPPER POSITION (absolute) that represents the "sun home"
+long solarHomePosition = (AZ_MAX_POS - AZ_MIN_POS) / 2; // Default to center
 
 // --- Forward declarations ---
 int avgRead(int sensorPin, int bufferIndex);
 void forceStepperLowOutputs();
 long clampAzTarget(long target);
-void calibrateAzimuth();
+void homeAzimuth();
+void scanForSun();
+void runFullCalibration();
 void parkNow();
 void unparkNow();
 void printStatusNow(int tl, int tr, int bl, int br, int azDiff, int elDiff);
-void saveAzZero();
+void saveSolarHome();
 void saveServoAngle();
+void saveAzMaxPos();
 void loadSavedSettings();
 void printHelp();
 
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(115500); // Increased baud rate for faster logging
   delay(50);
-
+  
   // configure stepper
   azStepper.setMaxSpeed(STEPPER_MAX_SPEED);
   azStepper.setAcceleration(STEPPER_ACCEL);
 
-  // ensure stepper pins are outputs so we can force them low if needed
+  // ensure stepper pins are outputs
   for (int i = 0; i < 4; ++i) {
     pinMode(STEPPER_PIN[i], OUTPUT);
     digitalWrite(STEPPER_PIN[i], LOW);
   }
 
-  // initialize LDR buffers with initial readings
+  // initialize LDR buffers
   for (int b = 0; b < NUM_AVG; ++b) {
     ldrBuffers[0][b] = analogRead(LDR_TL);
     ldrBuffers[1][b] = analogRead(LDR_TR);
@@ -135,52 +147,57 @@ void setup() {
   // servo
   tiltServo.attach(SERVO_PIN);
 
-  // load persisted settings (azimuth zero, servo angle)
+  // load persisted settings (solar home position, servo angle, AZ_MAX_POS)
   loadSavedSettings();
-
-  // set initial servo position to loaded value (or center by default)
   tiltServo.write(currentServo);
 
-  // set a rough current stepper position (we assume physical stepper position corresponds to currentPosition())
-  // azimuthZero contains the stored 'home' absolute position; don't overwrite currentPosition() here.
-  azStepper.setCurrentPosition(azStepper.currentPosition()); // no-op but explicit
+  // Initialize stepper position to the middle of the range if we are not using
+  // a physical home switch. The user must run 'h' or 'c' to set the true '0'.
+  azStepper.setCurrentPosition((AZ_MAX_POS + AZ_MIN_POS) / 2);
 
   if (SERIAL_DEBUG) {
     Serial.println();
-    Serial.println("Solar tracker (AccelStepper + Servo) started");
-    Serial.println("Commands (send single char or line end):");
-    Serial.println("  c    -> calibrate (coarse scan) and set home");
-    Serial.println("  Z    -> set current position as ZERO (saved to EEPROM)");
-    Serial.println("  p    -> park (move to park az + park servo)");
-    Serial.println("  u    -> unpark / resume tracking");
-    Serial.println("  s    -> status (print single-line status)");
-    Serial.println("  S<int> -> set servo angle and save, e.g. S90");
-    Serial.println("  ?    -> help");
+    Serial.println("Solar Tracker with Software Limits started");
+    printHelp(); // Print help menu
     Serial.print("Az limits enabled: "); Serial.println(AZ_LIMITS_ENABLED ? "YES" : "NO");
     if (AZ_LIMITS_ENABLED) {
-      Serial.print("REL AZ limits: "); Serial.print(AZ_MIN_POS); Serial.print(" .. "); Serial.println(AZ_MAX_POS);
-      Serial.print("Loaded azimuthZero (absolute steps) = "); Serial.println(azimuthZero);
-      Serial.print("Allowed absolute range: ");
-      Serial.print(azimuthZero + AZ_MIN_POS);
-      Serial.print(" .. ");
-      Serial.println(azimuthZero + AZ_MAX_POS);
+      Serial.print("ABSOLUTE AZ limits: "); Serial.print(AZ_MIN_POS); Serial.print(" .. "); Serial.println(AZ_MAX_POS);
+      Serial.print("Loaded solarHomePosition (absolute steps) = "); Serial.println(solarHomePosition);
     }
   }
 
   // optional: run auto calibration at boot
   if (AUTO_CALIBRATE_ON_BOOT) {
     delay(200); // allow sensor settle
-    calibrateAzimuth();
+    runFullCalibration();
+  }
+}
+
+void saveAzMaxPos() {
+  EEPROM.put(EEPROM_AZ_MAX_ADDR, AZ_MAX_POS);
+  if (SERIAL_DEBUG) {
+    Serial.print("Saved AZ_MAX_POS = ");
+    Serial.println(AZ_MAX_POS);
   }
 }
 
 void loadSavedSettings() {
-  // Read stored azimuth zero (long)
-  EEPROM.get(EEPROM_AZ_ZERO_ADDR, azimuthZero);
-  // Validate loaded value (EEPROM might be uninitialized)
-  if (azimuthZero < -10000000L || azimuthZero > 10000000L) {
-    azimuthZero = 0;
-    EEPROM.put(EEPROM_AZ_ZERO_ADDR, azimuthZero);
+  // Read stored solar home position (long)
+  EEPROM.get(EEPROM_SOLAR_HOME_ADDR, solarHomePosition);
+  
+  // NEW: Read stored AZ_MAX_POS (long)
+  long tempMaxPos = 0;
+  EEPROM.get(EEPROM_AZ_MAX_ADDR, tempMaxPos);
+
+  // If the loaded AZ_MAX_POS is a reasonable number, use it, otherwise use the default constant
+  if (tempMaxPos > AZ_MIN_POS && tempMaxPos < 8000) { // arbitrary sanity check
+      AZ_MAX_POS = tempMaxPos;
+  }
+  
+  // Validate loaded solar home position against the potentially new bounds
+  if (solarHomePosition < AZ_MIN_POS || solarHomePosition > AZ_MAX_POS) {
+    solarHomePosition = (AZ_MAX_POS - AZ_MIN_POS) / 2; // Default to center
+    EEPROM.put(EEPROM_SOLAR_HOME_ADDR, solarHomePosition);
   }
 
   // Read servo angle (int)
@@ -190,15 +207,11 @@ void loadSavedSettings() {
   currentServo = s;
 }
 
-void saveAzZero() {
-  EEPROM.put(EEPROM_AZ_ZERO_ADDR, azimuthZero);
+void saveSolarHome() {
+  EEPROM.put(EEPROM_SOLAR_HOME_ADDR, solarHomePosition);
   if (SERIAL_DEBUG) {
-    Serial.print("Saved azimuthZero (absolute steps) = ");
-    Serial.println(azimuthZero);
-    Serial.print("Allowed absolute range now: ");
-    Serial.print(azimuthZero + AZ_MIN_POS);
-    Serial.print(" .. ");
-    Serial.println(azimuthZero + AZ_MAX_POS);
+    Serial.print("Saved solarHomePosition (absolute steps) = ");
+    Serial.println(solarHomePosition);
   }
 }
 
@@ -211,51 +224,82 @@ void saveServoAngle() {
 }
 
 int avgRead(int sensorPin, int bufferIndex) {
-  // put new reading into circular buffer at current index
+  // Read the current sensor value and update the buffer
   ldrBuffers[bufferIndex][ldrIdx] = analogRead(sensorPin);
+  
+  // Calculate the sum of values in the buffer
   long s = 0;
   for (int i = 0; i < NUM_AVG; ++i) s += ldrBuffers[bufferIndex][i];
+  
+  // Return the average
   return (int)(s / NUM_AVG);
 }
 
 void forceStepperLowOutputs() {
-  // Reduce holding current when stepper is idle:
+  // Explicitly set motor pins low to stop holding torque and save power
   for (int i = 0; i < 4; ++i) digitalWrite(STEPPER_PIN[i], LOW);
 }
 
-// clamp a desired absolute az target to AZ limits if enabled.
-// AZ limits are relative ranges around azimuthZero (which stores an absolute stepper position representing home)
+// Function to clamp the target position to the absolute software bounds.
 long clampAzTarget(long target) {
   if (!AZ_LIMITS_ENABLED) return target;
-  long minAbs = azimuthZero + AZ_MIN_POS;
-  long maxAbs = azimuthZero + AZ_MAX_POS;
-  if (target < minAbs) return minAbs;
-  if (target > maxAbs) return maxAbs;
+  if (target < AZ_MIN_POS) return AZ_MIN_POS;
+  if (target > AZ_MAX_POS) return AZ_MAX_POS;
   return target;
 }
 
-void calibrateAzimuth() {
-  // Full coarse sweep calibration:
-  // - Sweep a portion (or full) revolution in increments to find the position where total light is maximum,
-  // - Move there and set that as home (azimuthZero = that absolute stepper position).
-  if (SERIAL_DEBUG) Serial.println("Calibration: starting azimuth scan...");
+// Software Homing: Moves the stepper until it hits the mechanical stop.
+void homeAzimuth() {
+  if (SERIAL_DEBUG) Serial.println("Homing: Moving to physical MIN stop (software limit)...");
+  
+  // Use slower speed for pushing against the stop
+  azStepper.setMaxSpeed(STEPPER_HOME_SPEED);
+  azStepper.setAcceleration(STEPPER_ACCEL / 2);
+  
+  // Set a blocking move far outside the range to ensure it hits the stop.
+  azStepper.moveTo(AZ_MIN_POS - HOME_BIND_DISTANCE);
+  
+  // Run until the target is reached (or motor stalls against the mechanical stop)
+  while (azStepper.distanceToGo() != 0) {
+    azStepper.run();
+  }
+  
+  // At this point, the motor should be physically pressed against the MIN stop.
+  // Set the current position to the logical start (AZ_MIN_POS = 0)
+  azStepper.setCurrentPosition(AZ_MIN_POS); 
+  
+  if (SERIAL_DEBUG) Serial.println("Homing: Assumed physical MIN stop reached. Stepper position 0 set.");
+  
+  // Move slightly *off* the stop (e.g., 20 steps) to reduce power draw/strain
+  azStepper.moveTo(AZ_MIN_POS + 20); 
+  while (azStepper.distanceToGo() != 0) azStepper.run();
+  
+  // Restore normal motor speeds
+  azStepper.setMaxSpeed(STEPPER_MAX_SPEED);
+  azStepper.setAcceleration(STEPPER_ACCEL);
+}
 
+// Scans for the brightest light *within the safe bounds* (AZ_MIN_POS to AZ_MAX_POS).
+void scanForSun() {
+  if (SERIAL_DEBUG) Serial.println("Calibration: starting sun scan...");
   delay(200); // settle
 
   long bestPos = azStepper.currentPosition();
   long bestLight = -1;
 
-  long stepsToScan = STEPS_PER_REV; // try a full revolution (can be reduced)
+  // Move to the starting bound (AZ_MIN_POS) to begin the scan
+  azStepper.moveTo(AZ_MIN_POS);
+  while (azStepper.distanceToGo() != 0) azStepper.run();
+
+  long stepsToScan = AZ_MAX_POS - AZ_MIN_POS;
   long stepsMoved = 0;
 
-  // move in coarse negative direction to sample (direction is arbitrary)
+  // Move in positive direction to sample across the entire allowed range
   while (stepsMoved < stepsToScan) {
-    // read averaged sensors
     int tl = avgRead(LDR_TL, 0);
     int tr = avgRead(LDR_TR, 1);
     int bl = avgRead(LDR_BL, 2);
     int br = avgRead(LDR_BR, 3);
-    // advance circular buffer index
     ldrIdx = (ldrIdx + 1) % NUM_AVG;
 
     long totalLight = (long)tl + tr + bl + br;
@@ -264,25 +308,13 @@ void calibrateAzimuth() {
       bestPos = azStepper.currentPosition();
     }
 
-    // step forward by coarse increment
-    long coarse = -CAL_SCAN_STEP; // coarse step negative; adjust sign if your wiring prefers other direction
-
-    long intendedPos = azStepper.currentPosition() + coarse;
-    // if next step would exceed absolute clamp, stop scanning early
-    if (AZ_LIMITS_ENABLED) {
-      long minAbs = azimuthZero + AZ_MIN_POS;
-      long maxAbs = azimuthZero + AZ_MAX_POS;
-      if (intendedPos < minAbs || intendedPos > maxAbs) {
-        break; // stop scan to avoid hitting limits
-      }
-    }
-
-    azStepper.move(coarse);
+    // Step forward by coarse increment
+    azStepper.move(CAL_SCAN_STEP); 
     while (azStepper.distanceToGo() != 0) {
       azStepper.run();
       delay(CAL_SCAN_DELAY_MS);
     }
-    stepsMoved += abs(coarse);
+    stepsMoved += CAL_SCAN_STEP;
   }
 
   if (SERIAL_DEBUG) {
@@ -292,26 +324,33 @@ void calibrateAzimuth() {
     Serial.println(bestPos);
   }
 
-  // Move to bestPos (clamp to absolute bounds)
-  long safeBest = clampAzTarget(bestPos);
-  azStepper.moveTo(safeBest);
+  // Move to bestPos
+  azStepper.moveTo(bestPos);
   while (azStepper.distanceToGo() != 0) azStepper.run();
 
-  // set this absolute stepper position as the stored zero/home
-  //azimuthZero = azStepper.currentPosition();
-  //saveAzZero();
-  //calibrated = true;
+  // Set this absolute stepper position as the stored *solar* home
+  solarHomePosition = azStepper.currentPosition();
+  saveSolarHome();
+  calibrated = true;
 
   forceStepperLowOutputs();
-  if (SERIAL_DEBUG) Serial.println("Calibration: done. Home set to best sun angle (stored as zero).");
+  if (SERIAL_DEBUG) Serial.println("Calibration: done. Solar home set to best sun angle.");
+}
+
+// This function combines Homing and Scanning
+void runFullCalibration() {
+  if (SERIAL_DEBUG) Serial.println("--- Starting Full Calibration ---");
+  homeAzimuth();      // 1. Find physical zero using software stall
+  scanForSun();       // 2. Find sun zero within the new bounds
+  if (SERIAL_DEBUG) Serial.println("--- Full Calibration Complete ---");
 }
 
 void parkNow() {
   if (SERIAL_DEBUG) Serial.println("Parking: moving to park position...");
 
-  // Move azimuth to PARK_AZ_REL_POS relative to calibrated home
-  long targetAbs = azimuthZero + PARK_AZ_REL_POS;
-  long safeTarget = clampAzTarget(targetAbs);
+  // Move azimuth relative to the *solar* home position
+  long targetAbs = solarHomePosition + PARK_AZ_REL_POS;
+  long safeTarget = clampAzTarget(targetAbs); // Clamp to machine bounds
   azStepper.moveTo(safeTarget);
 
   // move servo to park angle
@@ -330,29 +369,30 @@ void parkNow() {
 void unparkNow() {
   if (SERIAL_DEBUG) Serial.println("Unpark: resuming tracking.");
   isParked = false;
-  // tracking resumes next loop
 }
 
 void printStatusNow(int tl, int tr, int bl, int br, int azDiff, int elDiff) {
   long queued = azStepper.distanceToGo();
   long curPos = azStepper.currentPosition();
-  Serial.print(tl); Serial.print(' ');
+  Serial.print("LDRs: "); Serial.print(tl); Serial.print(' ');
   Serial.print(tr); Serial.print(' ');
   Serial.print(bl); Serial.print(' ');
-  Serial.print(br); Serial.print(" | ");
-  Serial.print(azDiff); Serial.print(' ');
-  Serial.print(elDiff); Serial.print(" | ");
-  Serial.print(currentServo); Serial.print(' ');
-  Serial.print((long)queued); Serial.print(' ');
-  Serial.print((long)curPos); Serial.print(' ');
-  Serial.print(" distToGo=");
-  Serial.println((long)azStepper.distanceToGo());
+  Serial.print(br); Serial.print(" | Diff: Az=");
+  Serial.print(azDiff); Serial.print(" El=");
+  Serial.print(elDiff); Serial.print(" | Pos: Servo=");
+  Serial.print(currentServo); Serial.print(" Stepper=");
+  Serial.print((long)curPos); Serial.print(" (Max Pos=");
+  Serial.print((long)AZ_MAX_POS); Serial.print(") (distToGo=");
+  Serial.print((long)queued); Serial.println(")");
 }
 
 void printHelp() {
   Serial.println("Commands:");
-  Serial.println("  c     -> calibrate (scan) and set home");
-  Serial.println("  Z     -> set current position as ZERO (saved)");
+  Serial.println("  c     -> RUN FULL CALIBRATION (Software Home + Sun Scan)");
+  Serial.println("  h     -> Home (find mechanical MIN stop, set 0)");
+  Serial.println("  B<int>-> Set AZIMUTH MAX BOUNDARY (saved), e.g., B4000"); 
+  Serial.println("  M<int>-> Move AZIMUTH to absolute step position, e.g., M2000 (0 is MIN)");
+  Serial.println("  Z     -> set CURRENT position as SOLAR HOME (saved)");
   Serial.println("  p     -> park");
   Serial.println("  u     -> unpark/resume");
   Serial.println("  s     -> status (print)");
@@ -370,21 +410,25 @@ void loop() {
         cmdBuf.trim();
         // single-char commands first
         if (cmdBuf.equalsIgnoreCase("c")) {
-          calibrateAzimuth();
+          // 'c' runs the full sequence: Home -> Scan
+          runFullCalibration();
+        } else if (cmdBuf.equalsIgnoreCase("h")) {
+          // 'h' for just homing
+          homeAzimuth();
         } else if (cmdBuf.equalsIgnoreCase("Z")) {
-          // set current absolute stepper position as zero and persist
-          azimuthZero = azStepper.currentPosition();
-          saveAzZero();
+          // 'Z' sets the *solar* home
+          solarHomePosition = azStepper.currentPosition();
+          saveSolarHome();
           if (SERIAL_DEBUG) {
-            Serial.print("Manual ZERO set to absolute stepper pos: ");
-            Serial.println(azimuthZero);
+            Serial.print("Manual SOLAR HOME set to absolute stepper pos: ");
+            Serial.println(solarHomePosition);
           }
         } else if (cmdBuf.equalsIgnoreCase("p")) {
           parkNow();
         } else if (cmdBuf.equalsIgnoreCase("u")) {
           unparkNow();
         } else if (cmdBuf.equalsIgnoreCase("s")) {
-          // immediate status
+          // Status command
           int tl = avgRead(LDR_TL, 0);
           int tr = avgRead(LDR_TR, 1);
           int bl = avgRead(LDR_BL, 2);
@@ -397,7 +441,7 @@ void loop() {
           int elDiff = elTop - elBottom;
           printStatusNow(tl, tr, bl, br, azDiff, elDiff);
         } else if (cmdBuf.startsWith("S")) {
-          // set servo angle and save: S90
+          // Servo command
           String num = cmdBuf.substring(1);
           int v = num.toInt();
           if (v < SERVO_MIN) v = SERVO_MIN;
@@ -408,6 +452,34 @@ void loop() {
           if (SERIAL_DEBUG) {
             Serial.print("Servo manually set to ");
             Serial.println(currentServo);
+          }
+        } else if (cmdBuf.startsWith("B")) {
+          // Boundary command
+          String num = cmdBuf.substring(1);
+          long v = num.toInt();
+          // Safety check: ensure boundary is greater than MIN (0)
+          if (v > AZ_MIN_POS) {
+              AZ_MAX_POS = v;
+              saveAzMaxPos();
+              if (SERIAL_DEBUG) {
+                  Serial.print("AZ_MAX_POS manually set to ");
+                  Serial.println(AZ_MAX_POS);
+              }
+          } else {
+              if (SERIAL_DEBUG) Serial.println("Boundary must be greater than 0.");
+          }
+        } else if (cmdBuf.startsWith("M")) {
+          // NEW: Move command
+          String num = cmdBuf.substring(1);
+          long targetPos = num.toInt();
+          long safeTarget = clampAzTarget(targetPos);
+          azStepper.moveTo(safeTarget);
+          if (SERIAL_DEBUG) {
+            Serial.print("Azimuth moving to absolute step position: ");
+            Serial.print(safeTarget);
+            Serial.print(". (Requested: ");
+            Serial.print(targetPos);
+            Serial.println(")");
           }
         } else if (cmdBuf.equals("?")) {
           printHelp();
@@ -424,25 +496,24 @@ void loop() {
     }
   }
 
-  // ----- Moving average of light read values -----
+  // ----- Sensor Reading and Difference Calculation -----
   int tl = avgRead(LDR_TL, 0);
   int tr = avgRead(LDR_TR, 1);
   int bl = avgRead(LDR_BL, 2);
   int br = avgRead(LDR_BR, 3);
   ldrIdx = (ldrIdx + 1) % NUM_AVG;
 
-  // light values on all four sides
-  int azLeft  = tl + bl; // left side
-  int azRight = tr + br; // right side
-  int azDiff  = azLeft - azRight;     // positive => more light on left
+  int azLeft  = tl + bl;
+  int azRight = tr + br;
+  int azDiff  = azLeft - azRight;
 
-  int elTop    = tl + tr; // top
-  int elBottom = bl + br; // bottom
-  int elDiff   = elTop - elBottom;    // positive => more light on top
+  int elTop    = tl + tr;
+  int elBottom = bl + br;
+  int elDiff   = elTop - elBottom;
 
   unsigned long now = millis();
 
-  // ----- Parking (automatic) based on low ambient light for duration -----
+  // ----- Parking (automatic) -----
   long totalLight = (long)tl + tr + bl + br;
   if (totalLight < PARK_LIGHT_THRESHOLD) {
     if (lightBelowSince == 0) lightBelowSince = now;
@@ -450,12 +521,12 @@ void loop() {
       parkNow();
     }
   } else {
-    lightBelowSince = 0; // reset timer
+    lightBelowSince = 0;
   }
 
-  // If parked, skip active tracking (but still run stepper so queued moves finish and accept commands)
+  // If parked, skip active tracking logic
   if (isParked) {
-    azStepper.run();
+    azStepper.run(); // Still need to run() to finish any queued moves
     if (SERIAL_DEBUG && now - lastDebugMillis >= DEBUG_INTERVAL_MS) {
       lastDebugMillis = now;
       printStatusNow(tl, tr, bl, br, azDiff, elDiff);
@@ -464,41 +535,35 @@ void loop() {
     return;
   }
 
-  // ----- elevation (servo) control (small proportional increments) -----
+  // ----- elevation (servo) control -----
   if (abs(elDiff) > EL_DEADBAND) {
-    // negative elDiff -> bottom brighter -> tilt down (invert sign if needed physically)
     int delta = -elDiff / SERVO_STEP_PER_DIFF;
-    // clamp per-loop delta
+    // Limit step size to avoid fast jerky movements
     if (delta > 3) delta = 3;
-    if (delta < -3) delta = -3;
+    if (delta < -3) delta = -3; 
+    
     if (abs(delta) >= 1) {
       currentServo = constrain(currentServo + delta, SERVO_MIN, SERVO_MAX);
       tiltServo.write(currentServo);
-      // don't flood EEPROM; save servo angle only on explicit S<int> or when we park; if you want autosave, uncomment:
-      // saveServoAngle();
     }
   }
 
   // ----- azimuth (side-to-side) control -----
   if (abs(azDiff) > AZ_DEADBAND) {
-    int dir = (azDiff > 0) ? 1 : -1; // positive azDiff => more light left => move toward left. Sign may need inversion after testing.
-    int requestedSteps = abs(azDiff) / AZ_DIFF_TO_STEP_DIV + 1; // basic proportional mapping
+    int dir = (azDiff > 0) ? 1 : -1;
+    // Calculate steps needed based on the difference
+    int requestedSteps = abs(azDiff) / AZ_DIFF_TO_STEP_DIV + 1;
     if (requestedSteps > MAX_STEPS_PER_CYCLE) requestedSteps = MAX_STEPS_PER_CYCLE;
 
     long cur = azStepper.currentPosition();
     long desired = cur + (long)dir * (long)requestedSteps;
+    
+    // Clamp the target to the absolute software bounds (0 to AZ_MAX_POS)
     long safeDesired = clampAzTarget(desired);
-
-//    if (safeDesired != desired && SERIAL_DEBUG) {
-  //    Serial.print("Az request clipped. desired=");
-    // Serial.print(desired);
-     //Serial.print(" clipped=");
-      //Serial.println(safeDesired);
-    //}
 
     azStepper.moveTo(safeDesired);
   } else {
-    // no movement request; if at target, reduce holding current
+    // No movement needed, turn off holding torque to save power
     if (azStepper.distanceToGo() == 0) forceStepperLowOutputs();
   }
 
@@ -511,6 +576,6 @@ void loop() {
     printStatusNow(tl, tr, bl, br, azDiff, elDiff);
   }
 
-  // small non-blocking delay to give other tasks time
+  // small non-blocking delay
   delay(10);
 }
